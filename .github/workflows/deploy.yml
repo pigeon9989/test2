@@ -30,11 +30,13 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-        with: { fetch-depth: 0 }
+        with:
+          fetch-depth: 0
 
       - name: gitleaks (secrets)
         uses: gitleaks/gitleaks-action@v2
-        env: { GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }} }
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: semgrep (SAST)
         uses: returntocorp/semgrep-action@v1
@@ -46,14 +48,19 @@ jobs:
             p/javascript
             p/security-audit
           generateSarif: '1'
-      - uses: github/codeql-action/upload-sarif@v3
+      - name: upload semgrep sarif
         if: always() && hashFiles('semgrep.sarif') != ''
-        with: { sarif_file: semgrep.sarif }
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: semgrep.sarif
 
       - uses: pnpm/action-setup@v4
-        with: { version: ${{ env.PNPM_VERSION }} }
+        with:
+          version: ${{ env.PNPM_VERSION }}
       - uses: actions/setup-node@v4
-        with: { node-version: ${{ env.NODE_VERSION }}, cache: pnpm }
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: pnpm
 
       - run: pnpm install --frozen-lockfile
       - name: pnpm audit (high+)
@@ -68,9 +75,11 @@ jobs:
           ignore-unfixed: true
           format: sarif
           output: trivy.sarif
-      - uses: github/codeql-action/upload-sarif@v3
+      - name: upload trivy sarif
         if: always() && hashFiles('trivy.sarif') != ''
-        with: { sarif_file: trivy.sarif }
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: trivy.sarif
 
   # ─────────────────────── build & test (and produce the page artifact) ──────────
   build:
@@ -79,9 +88,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: pnpm/action-setup@v4
-        with: { version: ${{ env.PNPM_VERSION }} }
+        with:
+          version: ${{ env.PNPM_VERSION }}
       - uses: actions/setup-node@v4
-        with: { node-version: ${{ env.NODE_VERSION }}, cache: pnpm }
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: pnpm
       - run: pnpm install --frozen-lockfile
       - run: pnpm typecheck
       - run: pnpm test
@@ -90,7 +102,8 @@ jobs:
       # GitHub Pages serves the artifact as-is at https://<owner>.github.io/<repo>/.
       # Vite's `base: '/test1/'` in vite.config.ts makes asset URLs match.
       - uses: actions/upload-pages-artifact@v3
-        with: { path: dist }
+        with:
+          path: dist
 
   # ───────────────────────────────── deploy ─────────────────────────────────
   deploy:
