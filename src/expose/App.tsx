@@ -57,10 +57,14 @@ const PHASE_EYEBROW: Record<Phase, string> = {
   'long-break':  'LONG BREAK',
 };
 
-function fmt(sec: number) {
-  const m = Math.floor(sec / 60).toString().padStart(2, '0');
-  const s = (sec % 60).toString().padStart(2, '0');
-  return `${m}:${s}`;
+// Format a millisecond duration as `MM:SS.mmm`. The 3-digit fractional
+// seconds make the timer feel alive instead of ticking once per second.
+function fmt(ms: number) {
+  const total = Math.max(0, ms);
+  const m  = Math.floor(total / 60000).toString().padStart(2, '0');
+  const s  = Math.floor((total % 60000) / 1000).toString().padStart(2, '0');
+  const ml = Math.floor(total % 1000).toString().padStart(3, '0');
+  return `${m}:${s}.${ml}`;
 }
 
 function todayKey(): string {
@@ -80,13 +84,20 @@ export default function App() {
   const preset = PRESETS.find((p) => p.id === presetId) ?? PRESETS[0]!;
 
   const [phase, setPhase] = useState<Phase>('focus');
-  const [remaining, setRemaining] = useState<number>(preset.focus);
+  // All time state is in **milliseconds** so the UI can show fractional
+  // seconds. `preset.focus` etc. are still seconds in the table; we
+  // multiply by 1000 wherever they meet the timer.
+  const [remaining, setRemaining] = useState<number>(preset.focus * 1000);
   const [running, setRunning] = useState(false);
   const [cycles, setCycles] = useState(0);
   const [history, setHistory] = useState<CompletedSession[]>([]);
   const [hosted, setHosted] = useState(false);
   const [hydrated, setHydrated] = useState(false);
   const tickRef = useRef<number | null>(null);
+  // Wall-clock anchor so the timer doesn't drift on slow frames or when the
+  // tab is throttled in the background — we always recompute remaining from
+  // (endAt - now) instead of subtracting tick intervals.
+  const endAtRef = useRef<number | null>(null);
   const narrow = useIsNarrow();
 
   /* Hydrate */
@@ -114,61 +125,80 @@ export default function App() {
   useEffect(() => {
     if (!running) {
       setPhase('focus');
-      setRemaining(preset.focus);
+      setRemaining(preset.focus * 1000);
+      endAtRef.current = null;
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [presetId]);
 
-  /* Tick */
+  /* Tick — 50ms cadence anchored to wall-clock so the ms display doesn't
+     drift when the tab is throttled or the renderer skips frames. */
   useEffect(() => {
-    if (!running) return;
+    if (!running) {
+      endAtRef.current = null;
+      return;
+    }
+    if (endAtRef.current === null) {
+      endAtRef.current = Date.now() + remaining;
+    }
     tickRef.current = window.setInterval(() => {
-      setRemaining((r) => {
-        if (r > 1) return r - 1;
-        const phaseDur = phase === 'focus' ? preset.focus : phase === 'short-break' ? preset.short : preset.long;
-        const finished: CompletedSession = {
-          id: crypto.randomUUID(),
-          phase,
-          durationSec: phaseDur,
-          endedAt: Date.now(),
-          preset: preset.id,
-        };
-        setHistory((h) => [finished, ...h].slice(0, 50));
+      const left = (endAtRef.current ?? 0) - Date.now();
+      if (left > 0) {
+        setRemaining(left);
+        return;
+      }
+      const phaseDurMs = (phase === 'focus' ? preset.focus
+                        : phase === 'short-break' ? preset.short
+                        : preset.long) * 1000;
+      const finished: CompletedSession = {
+        id: crypto.randomUUID(),
+        phase,
+        durationSec: phaseDurMs / 1000,
+        endedAt: Date.now(),
+        preset: preset.id,
+      };
+      setHistory((h) => [finished, ...h].slice(0, 50));
 
-        let nextCycles = cycles;
-        if (phase === 'focus') {
-          nextCycles = cycles + 1;
-          setCycles(nextCycles);
-        }
-        const np: Phase = phase === 'focus'
-          ? (nextCycles > 0 && nextCycles % preset.longEvery === 0 ? 'long-break' : 'short-break')
-          : 'focus';
-        setPhase(np);
-        const nd = np === 'focus' ? preset.focus : np === 'short-break' ? preset.short : preset.long;
+      let nextCycles = cycles;
+      if (phase === 'focus') {
+        nextCycles = cycles + 1;
+        setCycles(nextCycles);
+      }
+      const np: Phase = phase === 'focus'
+        ? (nextCycles > 0 && nextCycles % preset.longEvery === 0 ? 'long-break' : 'short-break')
+        : 'focus';
+      setPhase(np);
+      const ndMs = (np === 'focus' ? preset.focus
+                  : np === 'short-break' ? preset.short
+                  : preset.long) * 1000;
+      setRemaining(ndMs);
+      endAtRef.current = Date.now() + ndMs;
 
-        void platform.notify({
-          text: phase === 'focus' ? '집중 완료 — 휴식하세요' : '휴식 끝 — 다시 시작',
-          detail: `${PHASE_LABEL[np]} ${fmt(nd)}`,
-          tone: phase === 'focus' ? 'success' : 'info',
-          timeout: 4000,
-        });
-
-        return nd;
+      void platform.notify({
+        text: phase === 'focus' ? '집중 완료 — 휴식하세요' : '휴식 끝 — 다시 시작',
+        detail: `${PHASE_LABEL[np]} ${fmt(ndMs)}`,
+        tone: phase === 'focus' ? 'success' : 'info',
+        timeout: 4000,
       });
-    }, 1000);
+    }, 50);
     return () => { if (tickRef.current !== null) window.clearInterval(tickRef.current); };
+    // remaining is intentionally not in deps — including it would tear down
+    // the interval on every tick. We re-anchor endAtRef on running/phase change.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [running, phase, preset, cycles]);
 
   const skip = () => {
-    setRemaining(1);
+    // Land just past zero so the next tick rolls over into the next phase.
+    setRemaining(0);
+    endAtRef.current = Date.now();
     setRunning(true);
-    // The 1-second tick will immediately complete and roll over to the next phase.
   };
 
   const reset = () => {
     setRunning(false);
     setPhase('focus');
-    setRemaining(preset.focus);
+    setRemaining(preset.focus * 1000);
+    endAtRef.current = null;
   };
 
   // Space toggles run/pause when focus is *not* inside an input/textarea so it
@@ -189,7 +219,8 @@ export default function App() {
     if (confirm('완료 기록과 사이클을 모두 초기화할까요?')) {
       setRunning(false);
       setPhase('focus');
-      setRemaining(preset.focus);
+      setRemaining(preset.focus * 1000);
+      endAtRef.current = null;
       setCycles(0);
       setHistory([]);
       void platform.notify({ text: '기록이 초기화됐어요', tone: 'warn' });
@@ -208,8 +239,10 @@ export default function App() {
     };
   }, [history]);
 
-  const phaseDur = phase === 'focus' ? preset.focus : phase === 'short-break' ? preset.short : preset.long;
-  const progress = 1 - remaining / phaseDur;
+  const phaseDurMs = (phase === 'focus' ? preset.focus
+                    : phase === 'short-break' ? preset.short
+                    : preset.long) * 1000;
+  const progress = 1 - remaining / phaseDurMs;
 
   const accent =
     phase === 'focus' ? 'var(--accent, #2553f2)'
@@ -290,15 +323,28 @@ export default function App() {
           <div
             style={{
               fontFamily: 'var(--font-mono, ui-monospace, Menlo, monospace)',
-              fontSize: narrow ? 42 : 52,
+              fontSize: narrow ? 32 : 44,
               fontWeight: 600,
               color: 'var(--text)',
               letterSpacing: '-0.03em',
               lineHeight: 1,
+              display: 'flex',
+              alignItems: 'baseline',
+              gap: 1,
             }}
             className="tabular"
           >
-            {fmt(remaining)}
+            {(() => {
+              const [main, frac] = fmt(remaining).split('.');
+              return (
+                <>
+                  <span>{main}</span>
+                  <span style={{ fontSize: '0.5em', color: 'var(--text-muted)', fontWeight: 500 }}>
+                    .{frac}
+                  </span>
+                </>
+              );
+            })()}
           </div>
           <div style={{ fontSize: 11.5, color: 'var(--text-muted, #888)', marginTop: 8 }}>
             {PHASE_LABEL[phase]}
