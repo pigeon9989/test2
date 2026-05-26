@@ -43,9 +43,6 @@ jobs:
           python3 -m pip install --quiet semgrep
           semgrep scan --config p/owasp-top-ten --config p/typescript --config p/react --config p/security-audit --error --quiet --sarif --output semgrep.sarif || true
           semgrep scan --config p/owasp-top-ten --config p/typescript --config p/react --error --quiet
-      - uses: github/codeql-action/upload-sarif@v3
-        if: always() && hashFiles('semgrep.sarif') != ''
-        with: { sarif_file: semgrep.sarif }
 
       - uses: pnpm/action-setup@v4
         with: { version: '${{ env.PNPM_VERSION }}' }
@@ -65,9 +62,6 @@ jobs:
           curl -sSL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh -s -- -b /usr/local/bin v0.57.1
           trivy fs --severity HIGH,CRITICAL --ignore-unfixed --exit-code 0 \
             --format sarif --output trivy.sarif . || true
-      - uses: github/codeql-action/upload-sarif@v3
-        if: always() && hashFiles('trivy.sarif') != ''
-        with: { sarif_file: trivy.sarif }
 
   build:
     runs-on: ubuntu-latest
