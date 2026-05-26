@@ -1,8 +1,11 @@
-name: build · scan · deploy to GitHub Pages
+name: build · scan · deploy (action-less)
 
-# Single workflow that includes security gates as a BLOCKING prerequisite
-# for build/deploy. Previous setup had security in a separate workflow
-# with continue-on-error — that masks regressions.
+# Designed to survive `codeload.github.com` outages: we do not rely on any
+# `uses:` action that has to be downloaded from a GitHub-hosted tarball.
+# Everything is plain shell against tools already present on the runner
+# image (git, curl, node-via-curl). Deploy goes to a `gh-pages` branch
+# instead of `actions/deploy-pages` so the only Pages dependency is the
+# branch-build pipeline, configured separately on the repo Pages settings.
 
 on:
   push:
@@ -12,84 +15,107 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: read
+  contents: write
   pages: write
   id-token: write
-  security-events: write
 
 concurrency:
-  group: pages-${{ github.ref }}
+  group: deploy-${{ github.ref }}
   cancel-in-progress: false
 
 env:
-  NODE_VERSION: '20'
+  NODE_VERSION: '20.18.0'
   PNPM_VERSION: '9.15.0'
 
 jobs:
-  security:
+  pipeline:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-        with: { fetch-depth: 0 }
+      - name: checkout (raw git, no actions/checkout)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          git config --global init.defaultBranch main
+          git init -q
+          git remote add origin "https://x-access-token:${GH_TOKEN}@github.com/${{ github.repository }}.git"
+          # Shallow fetch the exact commit so a force-push to main doesn't race.
+          git fetch --depth 1 origin "${{ github.sha }}"
+          git checkout -q FETCH_HEAD
+
+      - name: install node (direct binary, no actions/setup-node)
+        run: |
+          set -euo pipefail
+          NODE_DIR="/opt/hostedtoolcache/node-${NODE_VERSION}"
+          mkdir -p "$NODE_DIR"
+          curl -fsSL "https://nodejs.org/dist/v${NODE_VERSION}/node-v${NODE_VERSION}-linux-x64.tar.xz" \
+            | tar -xJ --strip-components=1 -C "$NODE_DIR"
+          echo "$NODE_DIR/bin" >> "$GITHUB_PATH"
+          "$NODE_DIR/bin/node" --version
+          "$NODE_DIR/bin/npm"  --version
+
+      - name: install pnpm (npm i -g, no pnpm/action-setup)
+        run: |
+          set -euo pipefail
+          npm install -g "pnpm@${PNPM_VERSION}"
+          pnpm --version
 
       - name: gitleaks (secrets) — BLOCKING
         run: |
-          curl -sSL -o gitleaks.tgz https://github.com/gitleaks/gitleaks/releases/download/v8.21.2/gitleaks_8.21.2_linux_x64.tar.gz
+          set -euo pipefail
+          curl -fsSL -o gitleaks.tgz https://github.com/gitleaks/gitleaks/releases/download/v8.21.2/gitleaks_8.21.2_linux_x64.tar.gz
           tar -xzf gitleaks.tgz
           ./gitleaks detect --source . --redact --verbose --exit-code 1
 
       - name: semgrep (SAST) — BLOCKING
         run: |
+          set -euo pipefail
           python3 -m pip install --quiet semgrep
-          semgrep scan --config p/owasp-top-ten --config p/typescript --config p/react --config p/security-audit --error --quiet --sarif --output semgrep.sarif || true
           semgrep scan --config p/owasp-top-ten --config p/typescript --config p/react --error --quiet
 
-      - uses: pnpm/action-setup@v4
-        with: { version: '${{ env.PNPM_VERSION }}' }
-      - uses: actions/setup-node@v4
-        with:
-          node-version: ${{ env.NODE_VERSION }}
-          cache: pnpm
+      - name: install deps
+        run: pnpm install --frozen-lockfile
 
-      - run: pnpm install --frozen-lockfile
       - name: pnpm audit (HIGH+) — BLOCKING
         run: pnpm audit --prod --audit-level=high
 
       - name: trivy fs — INFORMATIONAL
-        # Keep info-only while dev-dep advisories are noisy. Promote to
-        # blocking by changing --exit-code 0 → 1 once clean.
+        # Best-effort scan. trivy fetches its CVE DB from GitHub Releases,
+        # which is currently flaky alongside the broader GitHub incident.
+        # `continue-on-error` keeps the pipeline moving when trivy can't
+        # install — actual blocking guards are gitleaks / semgrep / pnpm audit.
+        continue-on-error: true
         run: |
-          curl -sSL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh -s -- -b /usr/local/bin v0.57.1
-          trivy fs --severity HIGH,CRITICAL --ignore-unfixed --exit-code 0 \
-            --format sarif --output trivy.sarif . || true
+          set +e
+          curl -fsSL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh \
+            | sh -s -- -b /usr/local/bin v0.57.1 || { echo "::warning::trivy install failed — skipping"; exit 0; }
+          trivy fs --severity HIGH,CRITICAL --ignore-unfixed --exit-code 0 . || true
+          exit 0
 
-  build:
-    runs-on: ubuntu-latest
-    needs: security
-    steps:
-      - uses: actions/checkout@v4
-      - uses: pnpm/action-setup@v4
-        with: { version: '${{ env.PNPM_VERSION }}' }
-      - uses: actions/setup-node@v4
-        with:
-          node-version: ${{ env.NODE_VERSION }}
-          cache: pnpm
-      - run: pnpm install --frozen-lockfile
-      - run: pnpm typecheck
-      - run: pnpm test
-      - run: pnpm build
-      - uses: actions/configure-pages@v5
-        with: { enablement: true }
-      - uses: actions/upload-pages-artifact@v3
-        with: { path: dist }
+      - name: typecheck + test + build
+        run: |
+          set -euo pipefail
+          pnpm typecheck
+          pnpm test
+          pnpm build
 
-  deploy:
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-    runs-on: ubuntu-latest
-    needs: build
-    environment:
-      name: github-pages
-      url: ${{ steps.pages.outputs.page_url }}
-    steps:
-      - id: pages
-        uses: actions/deploy-pages@v4
+      - name: deploy → gh-pages branch (only on push to main)
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          cd dist
+          git init -q -b gh-pages
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git config user.name  "github-actions[bot]"
+          git remote add origin "https://x-access-token:${GH_TOKEN}@github.com/${{ github.repository }}.git"
+          echo "deploy ${GITHUB_SHA::7}" > .pages-deploy.txt
+          git add -A
+          git commit -q -m "deploy ${GITHUB_SHA::7}
+
+          source: ${{ github.sha }}
+          run:    ${{ github.run_id }}"
+          # Force-push: gh-pages is a generated artifact, not source-of-truth.
+          git push -q --force origin gh-pages
+          echo "::notice::Pages branch updated — pages-build-deployment will publish in 30-60s"
