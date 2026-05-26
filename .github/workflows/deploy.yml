@@ -1,0 +1,105 @@
+name: build · scan · deploy to GitHub Pages
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+# OIDC token writing (id-token) is needed for `actions/deploy-pages` to mint a deployment.
+# `pages: write` lets that action publish to the Pages site for this repo.
+# `security-events: write` lets us upload SARIF reports to the Security tab.
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+  security-events: write
+
+concurrency:
+  group: pages-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  NODE_VERSION: '20'
+  PNPM_VERSION: '9.15.0'
+
+jobs:
+  # ────────────────────── security gates (run on every event) ────────────────────
+  security:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+
+      - name: gitleaks (secrets)
+        uses: gitleaks/gitleaks-action@v2
+        env: { GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }} }
+
+      - name: semgrep (SAST)
+        uses: returntocorp/semgrep-action@v1
+        with:
+          config: >-
+            p/owasp-top-ten
+            p/typescript
+            p/react
+            p/javascript
+            p/security-audit
+          generateSarif: '1'
+      - uses: github/codeql-action/upload-sarif@v3
+        if: always() && hashFiles('semgrep.sarif') != ''
+        with: { sarif_file: semgrep.sarif }
+
+      - uses: pnpm/action-setup@v4
+        with: { version: ${{ env.PNPM_VERSION }} }
+      - uses: actions/setup-node@v4
+        with: { node-version: ${{ env.NODE_VERSION }}, cache: pnpm }
+
+      - run: pnpm install --frozen-lockfile
+      - name: pnpm audit (high+)
+        run: pnpm audit --prod --audit-level=high
+
+      - name: trivy (SCA + secret + misconfig)
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          scan-type: fs
+          scan-ref: .
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          format: sarif
+          output: trivy.sarif
+      - uses: github/codeql-action/upload-sarif@v3
+        if: always() && hashFiles('trivy.sarif') != ''
+        with: { sarif_file: trivy.sarif }
+
+  # ─────────────────────── build & test (and produce the page artifact) ──────────
+  build:
+    runs-on: ubuntu-latest
+    needs: security
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with: { version: ${{ env.PNPM_VERSION }} }
+      - uses: actions/setup-node@v4
+        with: { node-version: ${{ env.NODE_VERSION }}, cache: pnpm }
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm typecheck
+      - run: pnpm test
+      - run: pnpm build
+
+      # GitHub Pages serves the artifact as-is at https://<owner>.github.io/<repo>/.
+      # Vite's `base: '/test1/'` in vite.config.ts makes asset URLs match.
+      - uses: actions/upload-pages-artifact@v3
+        with: { path: dist }
+
+  # ───────────────────────────────── deploy ─────────────────────────────────
+  deploy:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    needs: build
+    environment:
+      name: github-pages
+      url: ${{ steps.pages.outputs.page_url }}
+    steps:
+      - id: pages
+        uses: actions/deploy-pages@v4

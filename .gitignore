@@ -1,0 +1,25 @@
+node_modules/
+dist/
+.cache/
+.vite/
+coverage/
+
+# env
+.env
+.env.local
+.env.*.local
+!.env.example
+
+# editor / OS
+.DS_Store
+Thumbs.db
+.vscode/*
+!.vscode/settings.example.json
+.idea/
+
+# scan reports
+trivy-report.json
+semgrep-report.json
+gitleaks-report.json
+*.sarif
+*.tsbuildinfo
